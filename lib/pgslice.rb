@@ -29,6 +29,8 @@ module PgSlice
         prep
       when "add_partitions"
         add_partitions
+      when "add_range_partitions"
+        add_range_partitions
       when "fill"
         fill
       when "swap"
@@ -38,7 +40,7 @@ module PgSlice
       when "unprep"
         unprep
       when nil
-        log "Commands: add_partitions, fill, prep, swap, unprep, unswap"
+        log "Commands: add_partitions, add_range_partitions, fill, prep, swap, unprep, unswap"
       else
         abort "Unknown command: #{@command}"
       end
@@ -65,7 +67,11 @@ module PgSlice
 
       unless options[:no_partition]
         abort "Column not found: #{column}" unless columns(table).include?(column)
-        abort "Invalid period: #{period}" unless SQL_FORMAT[period.to_sym]
+        abort "Invalid period: #{period}" unless SQL_FORMAT[period.to_sym] || options[:range_partition]
+      end
+
+      if options[:range_partition]
+        abort "Invalid partition range: #{period}" unless period.to_i.to_s == period
       end
 
       queries = []
@@ -191,6 +197,90 @@ CREATE TABLE #{partition_name}
 
       # order by current period, future periods asc, past periods desc
       trigger_defs = current_defs + future_defs + past_defs.reverse
+
+      if trigger_defs.any?
+        queries << <<-SQL
+CREATE OR REPLACE FUNCTION #{trigger_name}()
+    RETURNS trigger AS $$
+    BEGIN
+        IF #{trigger_defs.join("\n        ELSIF ")}
+        ELSE
+            RAISE EXCEPTION 'Date out of range. Ensure partitions are created.';
+        END IF;
+        RETURN NULL;
+    END;
+    $$ LANGUAGE plpgsql;
+        SQL
+      end
+
+      run_queries(queries) if queries.any?
+    end
+
+    def add_range_partitions
+      original_table = arguments.first
+      partition_size = arguments[1].to_i
+      table = options[:intermediate] ? "#{original_table}_intermediate" : original_table
+      trigger_name = self.trigger_name(original_table)
+
+      abort "Usage: pgslice add_range_partitions <table> <partition_size>" if arguments.length != 2
+      abort "Table not found: #{table}" unless table_exists?(table)
+      abort "Partition size not valid: #{partition_size}" unless partition_size > 0
+
+      # ensure table has trigger
+      abort "No trigger on table: #{table}\nDid you mean to use --intermediate?" unless has_trigger?(trigger_name, table)
+
+      index_defs = execute("select pg_get_indexdef(indexrelid) from pg_index where indrelid = $1::regclass AND indisprimary = 'f'", [original_table]).map { |r| r["pg_get_indexdef"] }
+      primary_key = self.primary_key(table)
+
+      queries = []
+
+      period, field, cast, needs_comment = settings_from_trigger(original_table, table)
+      abort "Could not read settings" unless period
+
+      if needs_comment
+        queries << "COMMENT ON TRIGGER #{trigger_name} ON #{table} is 'column:#{field},period:#{period},cast:#{cast}';"
+      end
+
+      partition_id_start = options[:range_start]
+      range = options[:future]
+
+      added_partitions = []
+      range.times do |n|
+        partition_name = "#{original_table}_#{partition_id_start}_#{partition_id_start + partition_size - 1}"
+        next if table_exists?(partition_name)
+        added_partitions << partition_name
+
+        queries << <<-SQL
+CREATE TABLE #{partition_name}
+    (CHECK (#{field} >= #{sql_cast(partition_id_start, cast)} AND #{field} < #{sql_cast(partition_id_start + partition_size, cast)}))
+    INHERITS (#{table});
+        SQL
+
+        queries << "ALTER TABLE #{partition_name} ADD PRIMARY KEY (#{primary_key});" if primary_key
+
+        index_defs.each do |index_def|
+          queries << index_def.sub(" ON #{original_table} USING ", " ON #{partition_name} USING ").sub(/ INDEX .+ ON /, " INDEX ON ") + ";"
+        end
+
+        partition_id_start += partition_size
+      end
+
+      # update trigger based on existing partitions
+      trigger_defs = []
+      name_format = self.name_format(period)
+      existing_tables = self.existing_tables(like: "#{original_table}_%").select { |t| /\A#{Regexp.escape("#{original_table}_")}\d+_\d+\z/.match(t) }
+
+      tables = (existing_tables + added_partitions).uniq.sort_by { |t| -t.split("_").last.to_i }
+
+      tables.each do |table|
+        partition_id_start  = table.split("_")[-2]
+        partition_id_end    = table.split("_")[-1].to_i + 1
+
+        sql = "(NEW.#{field} >= #{sql_cast(partition_id_start, cast)} AND NEW.#{field} < #{sql_cast(partition_id_end, cast)}) THEN
+            INSERT INTO #{table} VALUES (NEW.*);"
+
+        trigger_defs << sql
+      end
 
       if trigger_defs.any?
         queries << <<-SQL
@@ -347,10 +437,12 @@ INSERT INTO #{dest_table} (#{fields})
         o.boolean "--swapped"
         o.float "--sleep"
         o.integer "--future", default: 0
+        o.integer "--range-start", default: 0
         o.integer "--past", default: 0
         o.integer "--batch-size", default: 10000
         o.boolean "--dry-run", default: false
         o.boolean "--no-partition", default: false
+        o.boolean "--range-partition", default: false
         o.integer "--start"
         o.string "--url"
         o.string "--source-table"
@@ -529,7 +621,11 @@ INSERT INTO #{dest_table} (#{fields})
 
     def column_cast(table, column)
       data_type = execute("SELECT data_type FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = $3", [schema, table, column])[0]["data_type"]
-      data_type == "timestamp with time zone" ? "timestamptz" : "date"
+      if options[:range_partition]
+        data_type
+      else
+        data_type == "timestamp with time zone" ? "timestamptz" : "date"
+      end
     end
 
     def sql_date(time, cast)
@@ -539,6 +635,18 @@ INSERT INTO #{dest_table} (#{fields})
         fmt = "%Y-%m-%d"
       end
       "'#{time.strftime(fmt)}'::#{cast}"
+    end
+
+    def sql_cast(value, cast)
+      if cast == "integer"
+        value.to_i
+      elsif cast == "timestamptz"
+        fmt = "%Y-%m-%d %H:%M:%S UTC"
+        "'#{time.strftime(fmt)}'::#{cast}"
+      else
+        fmt = "%Y-%m-%d"
+        "'#{time.strftime(fmt)}'::#{cast}"
+      end
     end
 
     def name_format(period)
