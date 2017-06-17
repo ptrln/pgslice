@@ -67,11 +67,11 @@ module PgSlice
 
       unless options[:no_partition]
         abort "Column not found: #{column}" unless columns(table).include?(column)
-        abort "Invalid period: #{period}" unless SQL_FORMAT[period.to_sym] || options[:range_partition]
-      end
-
-      if options[:range_partition]
-        abort "Invalid partition range: #{period}" unless period.to_i.to_s == period
+        if options[:range_partition]
+          abort "Invalid partition range: #{period}" unless period.to_i.to_s == period
+        else
+          abort "Invalid period: #{period}" unless SQL_FORMAT[period.to_sym]
+        end
       end
 
       queries = []
