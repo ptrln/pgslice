@@ -272,15 +272,23 @@ CREATE TABLE #{partition_name}
 
       tables = (existing_tables + added_partitions).uniq.sort_by { |t| -t.split("_").last.to_i }
 
-      tables.each do |table|
-        partition_id_start  = table.split("_")[-2]
-        partition_id_end    = table.split("_")[-1].to_i + 1
+      ranges = []
 
-        sql = "(NEW.#{field} >= #{sql_cast(partition_id_start, cast)} AND NEW.#{field} < #{sql_cast(partition_id_end, cast)}) THEN
+      tables.each do |table|
+        partition_id_start  = table.split("_")[-2].to_i
+        partition_id_end    = table.split("_")[-1].to_i
+
+        ranges << (partition_id_start...partition_id_end)
+
+        sql = "(NEW.#{field} >= #{sql_cast(partition_id_start, cast)} AND NEW.#{field} < #{sql_cast(partition_id_end + 1, cast)}) THEN
             INSERT INTO #{table} VALUES (NEW.*);"
 
         trigger_defs << sql
       end
+
+      ranges = ranges.reverse
+
+      abort "Resulting trigger range would not be contiguous and mutually exclusive" unless ranges.map(&:first)[1..-1].map { |r| r - 1} == ranges.map(&:last)[0..-2]
 
       if trigger_defs.any?
         queries << <<-SQL
